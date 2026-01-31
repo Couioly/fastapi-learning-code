@@ -1,3 +1,4 @@
+import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
@@ -65,3 +66,6 @@ async def news(id:int):
     if id not in new_list:
         raise HTTPException(status_code=404,detail=f"未查询到新闻信息")
     return {"id": id, "content":f"查询到{id}的信息" }
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)

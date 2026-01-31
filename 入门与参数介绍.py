@@ -1,3 +1,4 @@
+import uvicorn
 from fastapi import FastAPI, Path, Query
 from pydantic import BaseModel, Field
 
@@ -112,3 +113,5 @@ class Book(BaseModel):
 async def add_book(book: Book):
     return book
 
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
