@@ -1,0 +1,2441 @@
+import time
+import random
+import base64
+from io import BytesIO
+from flask import Flask, request, jsonify, send_file
+import fake_useragent
+import requests
+from bs4 import BeautifulSoup
+import re
+from lxml import etree
+
+# 初始化Flask应用
+app = Flask(__name__)
+
+
+# -------------------------- 核心：手动实现全局跨域（替代flask-cors） --------------------------
+@app.after_request
+def add_cors_headers(response):
+    """全局跨域响应头：所有接口自动添加跨域配置"""
+    # 允许所有域名跨域（开发阶段用*，上线替换为小程序具体域名）
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    # 允许的请求方法（覆盖小程序常用的GET/POST/OPTIONS）
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    # 允许的请求头（适配JSON请求、自定义头X-Session-Id）
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Session-Id'
+    # 允许携带Cookie（可选，登录态需要时开启）
+    response.headers['Access-Control-Allow-Credentials'] = 'true'
+    # 预检请求缓存时间（86400秒=24小时，减少OPTIONS请求）
+    response.headers['Access-Control-Max-Age'] = '86400'
+    return response
+
+
+# 处理OPTIONS预检请求（小程序/浏览器会先发OPTIONS验证跨域）
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>', methods=['OPTIONS'])
+def handle_options(path):
+    """拦截所有OPTIONS请求，直接返回成功"""
+    response = jsonify({"code": 200, "msg": "preflight ok"})
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Session-Id'
+    response.headers['Access-Control-Allow-Credentials'] = 'true'
+    return response
+
+
+# -------------------------- 核心工具函数（原爬虫逻辑保留） --------------------------
+def encode_args(user: str, pwd: str) -> str:
+    """生成加密参数encoded"""
+    user_encode = base64.b64encode(user.encode())
+    pwd_encode = base64.b64encode(pwd.encode())
+    encoded = user_encode.decode() + "%%%" + pwd_encode.decode()
+    return encoded
+
+
+def get_captcha_png(session):
+    """获取验证码图片（返回二进制流）"""
+    captcha_url = 'http://jw.bkty.top:89/jsxsd/verifycode.servlet'
+    time.sleep(0.5)
+    captcha_response = session.get(captcha_url, headers={"User-Agent": fake_useragent.UserAgent().random})
+    return captcha_response.content
+
+
+def submit_login(session, user: str, pwd: str, captcha: str) -> tuple[bool, str]:
+    """提交登录验证，返回(是否成功, 提示信息)"""
+    encoded = encode_args(user, pwd)
+    data = {
+        "userAccount": '',
+        "userPassword": '',
+        "RANDOMCODE": captcha,
+        "encoded": encoded
+    }
+    login_url = 'http://jw.bkty.top:89/jsxsd/xk/LoginToXk'
+    try:
+        response = session.post(login_url, data=data, headers={"User-Agent": fake_useragent.UserAgent().random},
+                                timeout=5)
+        if "用户名或密码错误" in response.text:
+            return False, "用户名或密码错误"
+        elif "验证码错误" in response.text:
+            return False, "验证码错误"
+        elif base64.b64decode(encoded.split("%%%")[0]).decode() in response.text:
+            return True, "登录成功"
+        else:
+            return False, "未知错误"
+    except requests.exceptions.Timeout:
+        return False, "请求超时"
+    except Exception as e:
+        return False, f"登录异常：{str(e)}"
+
+
+def get_student_info(session) -> list:
+    """获取学生个人信息"""
+    student_url = 'http://jw.bkty.top:89/jsxsd/framework/xsMain_new.jsp?t1=1'
+    time.sleep(0.5)
+    res = session.get(student_url, headers={"User-Agent": fake_useragent.UserAgent().random}).text
+    student_info = re.findall(
+        r'<div class="f14 blue middletopdwxxtit">(.*)：</div><div class="middletopdwxxcont">(.*)</div></div>', res)
+    return student_info
+
+
+def get_exam(session, semester_stage: str = '', course_nature: str = '', class_name: str = '',
+             display_method: str = 'all') -> list:
+    """获取成绩信息"""
+
+    def format_td(html):
+        return re.findall(r'<td[^>]*?>(.*?)</td>', html)
+
+    lis = []
+    url = "http://jw.bkty.top:89/jsxsd/kscj/cjcx_list"
+    data = {
+        "kksj": semester_stage,
+        "kcxz": course_nature,
+        "kcmc": class_name,
+        "xsfs": display_method
+    }
+    time.sleep(0.5)
+    response = session.post(url, data=data, headers={"User-Agent": fake_useragent.UserAgent().random}).text.replace(
+        "\t", '').replace("\r", "")
+    soup = BeautifulSoup(response, "html.parser")
+    tr_list = [str(i).replace('\n', '').replace("\t", '').replace("\r", "") for i in soup.find_all("tr")]
+
+    par = re.compile(r'<th[^>]*>(.*?)</th>', re.DOTALL)
+    title = [i.replace("\n", '').strip() for i in par.findall(response)]
+    lis.append(title)
+
+    for i in range(1, len(tr_list)):
+        lis.append(format_td(tr_list[i]))
+    return lis
+
+
+def format_table(html_content: str) -> list:
+    """解析课表HTML为二维列表"""
+    soup = BeautifulSoup(html_content, 'html.parser')
+    table = soup.find('table', {'class': 'table'})
+    if not table:
+        return []
+    course_table = []
+    # 处理表头
+    header_row = [cell.get_text(strip=True) for cell in table.find('thead').find_all('th')]
+    course_table.append(header_row)
+    # 处理内容行
+    rows = table.find('tbody').find_all('tr')
+    for row in rows:
+        course_row = []
+        cells = row.find_all('td')
+        # 第一列（时间/节次）
+        time_text = cells[0].get_text(strip=True).replace('\n', ' ')
+        course_row.append(time_text)
+        # 其他列（课程+地点）
+        for cell in cells[1:]:
+            course_p = cell.find('p')
+            if course_p:
+                course_name = course_p.get_text(strip=True)
+                course_info = course_p.get('title', '')
+                location = ""
+                if "上课地点：" in course_info:
+                    location_start = course_info.find("上课地点：") + 5
+                    location_end = course_info.find("<br/>", location_start)
+                    location = course_info[location_start:location_end] if location_end != -1 else course_info[
+                                                                                                   location_start:]
+                course_row.append(f"{course_name}: {location}")
+            else:
+                course_row.append("")
+        course_table.append(course_row)
+    return course_table
+
+
+def get_lesson(session, now_time: str) -> list:
+    """获取指定日期的课表"""
+    url = "http://jw.bkty.top:89/jsxsd/framework/main_index_loadkb.jsp"
+    data = {"rq": now_time}
+    time.sleep(0.5)
+    response = session.post(url, data=data, headers={"User-Agent": fake_useragent.UserAgent().random}).text.replace(
+        "\t", '').replace("\r", "")
+    return format_table(response)
+
+def get_basic_url():
+    """
+    获取通知公告的7条基本URL
+    :return: 基本URL列表
+    """
+    basic_url = 'https://tj.ustb.edu.cn/jwc/tzgg1/jxyx.htm'
+    response = requests.get(basic_url)
+    response.encoding = 'utf-8'
+
+    # 解析HTML
+    tree = etree.HTML(response.text)
+
+    # 使用Xpath提取7个li标签
+    li_elements = tree.xpath('/html/body/div[7]/div[1]/ul/*')
+
+    # 提取title和href并以字典形式保存
+    categories = []
+    for li in li_elements:
+        # 提取title
+        title = li.xpath('.//a/text()')[0].strip() if li.xpath('.//a/text()') else ''
+        # 提取href
+        href = li.xpath('.//a/@href')[0] if li.xpath('.//a/@href') else ''
+        # 构建完整的URL
+        full_href = basic_url.rsplit('/', 1)[0] + '/' + href if href else ''
+        # 添加到分类列表
+        categories.append({'title': title, 'href': full_href})
+        
+    return categories
+
+def format_url(detail_href):
+    """
+    格式化URL
+    :param detail_href: 原始URL
+    :return: 格式化后的URL
+    """
+    # 构建完整的URL
+    if detail_href:
+        if detail_href.startswith('http'):
+            full_detail_href = detail_href
+        else:
+            # 根据当前分类URL构建完整路径
+            full_detail_href = "https://tj.ustb.edu.cn/jwc" + detail_href.strip('..')
+    else:
+        full_detail_href = ''
+
+    return full_detail_href
+
+def get_detail_info(category_url):
+    """
+    获取分类下的通知公告详细信息
+    :param category_url: 分类URL
+    :return: 通知公告详细信息字典
+    """
+    # 发送请求
+    category_response = requests.get(category_url)
+    category_response.encoding = 'utf-8'
+    
+    # 解析HTML
+    category_tree = etree.HTML(category_response.text)
+    
+    # 提取指定Xpath路径下的li标签
+    detail_li_elements = category_tree.xpath('/html/body/div[7]/div[2]/div[2]/ul/li')
+    
+    # 提取每个li标签中的title和href
+    detail_items = {}
+    for li in detail_li_elements:
+        # 提取title
+        detail_title = li.xpath('.//a/text()')[0].strip() if li.xpath('.//a/text()') else ''
+        # 提取href
+        detail_href = li.xpath('.//a/@href')[0] if li.xpath('.//a/@href') else ''
+        new_url = format_url(detail_href)
+        
+        # 添加到详细信息字典
+        if detail_title:
+            detail_items[detail_title] = new_url
+
+    return detail_items
+
+
+def get_final_result():
+    """
+    获取通知公告的最终结果
+    :return: 最终结果字典
+    """
+    # 访问每个分类链接，提取详细信息
+    final_result = {}
+    for category in get_basic_url():
+        category_title = category['title']
+        category_url = category['href']
+            
+        try:
+            detail_items = get_detail_info(category_url)
+            # 添加到最终结果
+            final_result[category_title] = detail_items
+
+        except Exception as e:
+            print(f"处理 {category_title} 时出错: {str(e)}")
+            final_result[category_title] = {}
+    
+    return final_result
+
+def get_tr_elements(tr_elements):
+    # 存储结果的列表
+    results = []
+    # 遍历每个tr元素
+    for tr in tr_elements:
+        # 提取当前tr中的所有td元素
+        td_elements = tr.xpath("./td")
+        # 遍历每个td元素
+        for td in td_elements:
+            # 提取a标签
+            a_elements = td.xpath("./a")
+            for a in a_elements:
+                # 提取href
+                hrefs = a.xpath("./@href")
+                if hrefs:
+                    href = "https://tj.ustb.edu.cn/news/"+hrefs[0]
+                    # 提取文本值（包括所有子节点的文本）
+                    text_values = a.xpath(".//text()")
+                    text_value = "".join(text_values).strip() if text_values else ""
+                    # 以键值对形式存储
+                    results.append({text_value: href})
+    return results
+
+def get_college_class():
+    url = "https://tj.ustb.edu.cn/news/yxdt.htm"
+    response = requests.get(url)
+    response.encoding = 'utf-8'
+
+    # 解析HTML
+    html = etree.HTML(response.text)
+    # 定位目标容器
+    container = html.xpath("/html/body/div[4]/div[1]/div[2]/div[2]/div/div/table/tbody")[0]
+    # 提取所有tr元素
+    tr_elements = container.xpath("./tr")
+    results = get_tr_elements(tr_elements)
+    return results
+
+def get_college_class_news(class_url):
+    """
+    获取系部动态指定url页面的文章链接
+    :param class_url: 系部动态url
+    :return: 文章链接字典
+    :key: 文章标题
+    :value: 包含文章链接和时间信息的字典
+    """
+    response = requests.get(class_url)
+    response.encoding = 'utf-8'
+
+    # 解析HTML
+    html = etree.HTML(response.text)
+    
+    # 定位目标容器
+    container = html.xpath("/html/body/div[4]/div[1]/div[2]/ul")[0]
+    
+    # 提取所有li元素
+    li_elements = container.xpath("./li")
+    
+    # 存储结果的字典
+    article_results = {}
+    
+    # 遍历每个li元素
+    for li in li_elements:
+        # 提取h1标签内容作为键
+        h1_elements = li.xpath(".//h1")
+        if not h1_elements:
+            continue
+        title = "".join(h1_elements[0].xpath(".//text()")).strip()
+        if not title:
+            continue
+        
+        # 提取a标签中的href
+        a_elements = li.xpath(".//a")
+        href = ""
+        if a_elements:
+            hrefs = a_elements[0].xpath("./@href")
+            if hrefs:
+                href = hrefs[0]
+                # 处理相对路径
+                if not href.startswith('http'):
+                    href = "https://tj.ustb.edu.cn/news" + href.strip('..')
+   
+        # 提取div class="time"的span里的时间信息
+        time_elements = li.xpath(".//div[@class='time']/span")
+        time = ""
+        if time_elements:
+            time = "".join(time_elements[0].xpath(".//text()")).strip()
+        
+        # 构建值字典
+        value_dict = {
+            "href": href,
+            "time": time
+        }
+        
+        # 添加到结果字典
+        article_results[title] = value_dict
+    
+    return article_results
+
+def get_student_img(session):
+    """
+    获取学生照片
+    :param session: requests.Session对象
+    :return: Base64编码的图片数据
+    """
+    img_url = 'http://jw.bkty.top:89/jsxsd/grxx/xszpLoad'
+    time.sleep(0.5)
+    img_response = session.get(img_url, headers={"User-Agent": fake_useragent.UserAgent().random})
+    
+    # 将图片转换为Base64编码
+    img_data = base64.b64encode(img_response.content).decode('utf-8')
+    # 小程序支持的Base64格式，需要加上前缀
+    img_base64 = f'data:image/jpeg;base64,{img_data}'
+    
+    return img_base64
+
+def get_all_student_info(session) -> dict:
+    """
+    提取学生所有信息
+    :param session: requests.Session对象
+    :return: 学生信息字典
+    """
+    student_url = "http://jw.bkty.top:89/jsxsd/grxx/xsxx"
+    resp = session.get(student_url, headers={"User-Agent": fake_useragent.UserAgent().random})
+    resp.encoding = "utf-8"
+    tree = etree.HTML(resp.text)
+
+    info_dict = {}
+    
+    # 提取院系、专业、学制、班级、学号
+    dept_row = tree.xpath("//tr[contains(., '院系')]")
+    if dept_row:
+        dept_tds = dept_row[0].xpath("./td")
+        if len(dept_tds) >= 5:
+            dept_text = dept_tds[0].xpath(".//text()")[0].strip()
+            if '院系：' in dept_text:
+                info_dict['院系'] = dept_text.split('院系：')[1].strip()
+            major_text = dept_tds[1].xpath(".//text()")[0].strip()
+            if '专业：' in major_text:
+                info_dict['专业'] = major_text.split('专业：')[1].strip()
+            duration_text = dept_tds[2].xpath(".//text()")[0].strip()
+            if '学制：' in duration_text:
+                info_dict['学制'] = duration_text.split('学制：')[1].strip()
+            class_text = dept_tds[3].xpath(".//text()")[0].strip()
+            if '班级：' in class_text:
+                info_dict['班级'] = class_text.split('班级：')[1].strip()
+            student_id_text = dept_tds[4].xpath(".//text()")[0].strip()
+            if '学号：' in student_id_text:
+                info_dict['学号'] = student_id_text.split('学号：')[1].strip()
+    
+    # 提取姓名、性别
+    name_row = tree.xpath("//tr[contains(., '姓名')]")
+    if name_row:
+        name_tds = name_row[0].xpath("./td")
+        if len(name_tds) >= 4:
+            info_dict['姓名'] = name_tds[1].xpath(".//text()")[0].strip()
+            info_dict['性别'] = name_tds[3].xpath(".//text()")[0].strip()
+    
+    # 提取出生日期、婚否、本人电话
+    birth_row = tree.xpath("//tr[contains(., '出生日期')]")
+    if birth_row:
+        birth_tds = birth_row[0].xpath("./td")
+        if len(birth_tds) >= 6:
+            info_dict['出生日期'] = birth_tds[1].xpath(".//text()")[0].strip()
+            info_dict['婚否'] = birth_tds[3].xpath(".//text()")[0].strip()
+            info_dict['本人电话'] = birth_tds[5].xpath(".//text()")[0].strip()
+    
+    # 提取政治面貌
+    political_row = tree.xpath("//tr[contains(., '政治面貌')]")
+    if political_row:
+        political_tds = political_row[0].xpath("./td")
+        for i, td in enumerate(political_tds):
+            td_text = td.xpath(".//text()")[0].strip()
+            if '政治面貌' in td_text:
+                if i + 1 < len(political_tds):
+                    info_dict['政治面貌'] = political_tds[i + 1].xpath(".//text()")[0].strip()
+                break
+    
+    # 提取籍贯
+    native_row = tree.xpath("//tr[contains(., '籍贯')]")
+    if native_row:
+        native_tds = native_row[0].xpath("./td")
+        for i, td in enumerate(native_tds):
+            td_text = td.xpath(".//text()")[0].strip()
+            if '籍贯' in td_text:
+                if i + 1 < len(native_tds):
+                    info_dict['籍贯'] = native_tds[i + 1].xpath(".//text()")[0].strip()
+                break
+    
+    # 提取入党团时间、民族
+    party_row = tree.xpath("//tr[contains(., '入党团时间')]")
+    if party_row:
+        party_tds = party_row[0].xpath("./td")
+        for i, td in enumerate(party_tds):
+            td_text = td.xpath(".//text()")[0].strip()
+            if '入党团时间' in td_text:
+                if i + 1 < len(party_tds):
+                    info_dict['入党团时间'] = party_tds[i + 1].xpath(".//text()")[0].strip()
+            elif '民族' in td_text:
+                if i + 1 < len(party_tds):
+                    info_dict['民族'] = party_tds[i + 1].xpath(".//text()")[0].strip()
+    
+    # 提取家庭现住址、火车到站
+    address_row = tree.xpath("//tr[contains(., '家庭现住址')]")
+    if address_row:
+        address_tds = address_row[0].xpath("./td")
+        for i, td in enumerate(address_tds):
+            td_text = td.xpath(".//text()")[0].strip()
+            if '家庭现住址' in td_text:
+                if i + 1 < len(address_tds):
+                    info_dict['家庭现住址'] = address_tds[i + 1].xpath(".//text()")[0].strip()
+            elif '火车到站' in td_text:
+                if i + 1 < len(address_tds):
+                    info_dict['火车到站'] = address_tds[i + 1].xpath(".//text()")[0].strip()
+    
+    # 提取邮政编码、家庭电话、联系人
+    post_row = tree.xpath("//tr[contains(., '邮政编码')]")
+    if post_row:
+        post_tds = post_row[0].xpath("./td")
+        for i, td in enumerate(post_tds):
+            td_text = td.xpath(".//text()")[0].strip()
+            if '邮政编码' in td_text:
+                if i + 1 < len(post_tds):
+                    info_dict['邮政编码'] = post_tds[i + 1].xpath(".//text()")[0].strip()
+            elif '家庭电话' in td_text:
+                if i + 1 < len(post_tds):
+                    info_dict['家庭电话'] = post_tds[i + 1].xpath(".//text()")[0].strip()
+            elif '联系人' in td_text:
+                if i + 1 < len(post_tds):
+                    info_dict['联系人'] = post_tds[i + 1].xpath(".//text()")[0].strip()
+    
+    # 提取入学日期
+    enroll_row = tree.xpath("//tr[contains(., '入学日期')]")
+    if enroll_row:
+        enroll_tds = enroll_row[0].xpath("./td")
+        for i, td in enumerate(enroll_tds):
+            td_text = td.xpath(".//text()")[0].strip()
+            if '入学日期' in td_text:
+                if i + 1 < len(enroll_tds):
+                    info_dict['入学日期'] = enroll_tds[i + 1].xpath(".//text()")[0].strip()
+                break
+    
+    # 提取入学学号、身份证编号
+    exam_row = tree.xpath("//tr[contains(., '入学考号')]")
+    if exam_row:
+        exam_tds = exam_row[0].xpath("./td")
+        for i, td in enumerate(exam_tds):
+            td_text = td.xpath(".//text()")[0].strip()
+            if '入学考号' in td_text:
+                if i + 1 < len(exam_tds):
+                    info_dict['入学学号'] = exam_tds[i + 1].xpath(".//text()")[0].strip()
+            elif '身份证编号' in td_text:
+                if i + 1 < len(exam_tds):
+                    info_dict['身份证编号'] = exam_tds[i + 1].xpath(".//text()")[0].strip()
+
+    return info_dict
+
+class BaseExtractor:
+    """基础提取器类，提供通用功能"""
+    
+    def __init__(self, source):
+        """初始化提取器
+        
+        Args:
+            source: 数据源，远程URL
+        """
+        self.source = source
+        self.data = None
+    
+    def _get_soup_from_url(self, url):
+        """从URL获取BeautifulSoup对象
+        
+        Args:
+            url: 远程URL
+            
+        Returns:
+            BeautifulSoup对象
+        """
+        # 发送HTTP请求获取内容
+        response = requests.get(url, timeout=10)
+        response.encoding = 'utf-8'  # 设置编码为UTF-8
+        
+        # 检查响应状态码
+        if response.status_code != 200:
+            raise requests.HTTPError(f"请求失败，状态码：{response.status_code}")
+        
+        # 解析HTML内容
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        return soup
+
+class HotBorrowedExtractor(BaseExtractor):
+    """热门借阅数据提取器类"""
+    
+    def extract_data(self):
+        """提取数据"""
+        # 从URL获取内容
+        soup = self._get_soup_from_url(self.source)
+        
+        # 提取统计信息
+        stats_info = self._extract_stats_info(soup)
+        
+        # 提取分类列表
+        category_links = self._extract_category_links(soup)
+        
+        # 提取书籍列表
+        books = self._extract_books(soup)
+        
+        # 整合所有数据
+        self.data = {
+            '统计信息': stats_info,
+            '分类列表': category_links,
+            '书籍列表': books
+        }
+        
+        return self.data
+    
+    def _extract_stats_info(self, soup):
+        """提取统计信息"""
+        stats_info = {}
+        note_tag = soup.find('p', class_='note')
+        if note_tag:
+            note_text = note_tag.get_text(strip=True)
+            # 提取统计范围
+            stats_range = note_text.split('统计范围：')[1].split('个月')[0].strip()
+            # 提取统计方式
+            stats_method = note_text.split('统计方式：')[1].split('分类')[0].strip()
+            # 提取分类
+            category = note_text.split('分类：')[1].strip()
+            
+            stats_info = {
+                '统计范围': stats_range + '个月',
+                '统计方式': stats_method,
+                '分类': category
+            }
+        return stats_info
+    
+    def _extract_category_links(self, soup):
+        """提取分类列表"""
+        category_links = []
+        underlinemenu_tag = soup.find('div', id='underlinemenu')
+        if underlinemenu_tag:
+            ul_tag = underlinemenu_tag.find('ul')
+            if ul_tag:
+                li_tags = ul_tag.find_all('li')
+                for li in li_tags:
+                    a_tag = li.find('a')
+                    if a_tag:
+                        category_links.append({
+                            '分类': a_tag.text.strip(),
+                            '链接': a_tag['href'] if a_tag.has_attr('href') else ''
+                        })
+        return category_links
+    
+    def _extract_books(self, soup):
+        """提取书籍列表"""
+        books = []
+        table_tag = soup.find('table', class_='table_line')
+        if table_tag:
+            tr_tags = table_tag.find_all('tr')[1:]  # 跳过表头
+            for tr in tr_tags:
+                td_tags = tr.find_all('td')
+                if len(td_tags) >= 8:
+                    # 提取序列
+                    sequence = td_tags[0].get_text(strip=True)
+                    # 提取题名
+                    title_a_tag = td_tags[1].find('a')
+                    title = title_a_tag.get_text(strip=True) if title_a_tag else td_tags[1].get_text(strip=True)
+                    # 提取责任者
+                    author = td_tags[2].get_text(strip=True)
+                    # 提取出版信息
+                    pub_info = td_tags[3].get_text(strip=True)
+                    # 提取索书号
+                    call_no = td_tags[4].get_text(strip=True)
+                    # 提取馆藏
+                    holdings = td_tags[5].get_text(strip=True)
+                    # 提取借阅册次
+                    borrow_count = td_tags[6].get_text(strip=True)
+                    # 提取借阅比
+                    borrow_ratio = td_tags[7].get_text(strip=True)
+                    
+                    book = {
+                        '序列': sequence,
+                        '题名': title,
+                        '责任者': author,
+                        '出版信息': pub_info,
+                        '索书号': call_no,
+                        '馆藏': holdings,
+                        '借阅册次': borrow_count,
+                        '借阅比': borrow_ratio
+                    }
+                    books.append(book)
+        return books
+
+class HotScoreExtractor(BaseExtractor):
+    """热门评分数据提取器类"""
+    
+    def extract_data(self):
+        """提取数据"""
+        # 从URL获取内容
+        soup = self._get_soup_from_url(self.source)
+        
+        # 提取分类列表
+        category_links = self._extract_category_links(soup)
+        
+        # 提取书籍列表
+        books = self._extract_books(soup)
+        
+        # 整合所有数据
+        self.data = {
+            '分类列表': category_links,
+            '书籍列表': books
+        }
+        
+        return self.data
+    
+    def _extract_category_links(self, soup):
+        """提取分类列表"""
+        category_links = []
+        
+        # 查找分类链接区域
+        underlinemenu_tag = soup.find('div', id='underlinemenu')
+        if underlinemenu_tag:
+            ul_tag = underlinemenu_tag.find('ul')
+            if ul_tag:
+                li_tags = ul_tag.find_all('li')
+                for li in li_tags:
+                    a_tag = li.find('a')
+                    if a_tag:
+                        category_links.append({
+                            '分类': a_tag.text.strip(),
+                            '链接': a_tag['href'] if a_tag.has_attr('href') else ''
+                        })
+        else:
+            # 尝试查找其他可能的分类区域
+            all_a_tags = soup.find_all('a')
+            for a in all_a_tags:
+                if '总体排行' in a.text:
+                    ul_tag = a.find_parent('ul')
+                    if ul_tag:
+                        li_tags = ul_tag.find_all('li')
+                        for li in li_tags:
+                            a_tag = li.find('a')
+                            if a_tag:
+                                category_links.append({
+                                    '分类': a_tag.text.strip(),
+                                    '链接': a_tag['href'] if a_tag.has_attr('href') else ''
+                                })
+                        break
+        
+        return category_links
+    
+    def _extract_books(self, soup):
+        """提取书籍列表"""
+        books = []
+        
+        # 查找书籍表格
+        table_tag = soup.find('table', class_='table_line')
+        if table_tag:
+            tr_tags = table_tag.find_all('tr')[1:]  # 跳过表头
+            
+            for i, tr in enumerate(tr_tags):
+                td_tags = tr.find_all('td')
+                if len(td_tags) >= 7:
+                    # 提取序列
+                    sequence = td_tags[0].get_text(strip=True)
+                    # 提取题名
+                    title_a_tag = td_tags[1].find('a')
+                    title = title_a_tag.get_text(strip=True) if title_a_tag else td_tags[1].get_text(strip=True)
+                    # 提取责任者
+                    author = td_tags[2].get_text(strip=True)
+                    # 提取出版信息
+                    pub_info = td_tags[3].get_text(strip=True)
+                    # 提取索书号
+                    call_no = td_tags[4].get_text(strip=True)
+                    # 提取总体评价
+                    total_score = td_tags[5].get_text(strip=True)
+                    # 如果总体评价是图片，则提取图片alt或src
+                    if not total_score:
+                        img_tag = td_tags[5].find('img')
+                        if img_tag:
+                            if img_tag.has_attr('alt'):
+                                total_score = img_tag['alt']
+                            elif img_tag.has_attr('src'):
+                                # 从图片src中提取评分信息
+                                src = img_tag['src']
+                                if 'star' in src:
+                                    # 提取星级数
+                                    star_count = src.split('star')[1].split('.')[0]
+                                    total_score = f'{star_count}星'
+                    # 提取评价人次
+                    rating_count = td_tags[6].get_text(strip=True)
+                    
+                    book = {
+                        '序列': sequence,
+                        '题名': title,
+                        '责任者': author,
+                        '出版信息': pub_info,
+                        '索书号': call_no,
+                        '总体评价': total_score,
+                        '评价人次': rating_count
+                    }
+                    books.append(book)
+        
+        return books
+
+class HotShelfExtractor(BaseExtractor):
+    """热门收藏数据提取器类"""
+    
+    def extract_data(self):
+        """提取数据"""
+        # 从URL获取内容
+        soup = self._get_soup_from_url(self.source)
+        
+        # 提取分类列表
+        category_links = self._extract_category_links(soup)
+        
+        # 提取书籍列表
+        books = self._extract_books(soup)
+        
+        # 整合所有数据
+        self.data = {
+            '分类列表': category_links,
+            '书籍列表': books
+        }
+        
+        return self.data
+    
+    def _extract_category_links(self, soup):
+        """提取分类列表"""
+        category_links = []
+        
+        # 查找分类链接区域
+        underlinemenu_tag = soup.find('div', id='underlinemenu')
+        if underlinemenu_tag:
+            ul_tag = underlinemenu_tag.find('ul')
+            if ul_tag:
+                li_tags = ul_tag.find_all('li')
+                for li in li_tags:
+                    a_tag = li.find('a')
+                    if a_tag:
+                        category_links.append({
+                            '分类': a_tag.text.strip(),
+                            '链接': a_tag['href'] if a_tag.has_attr('href') else ''
+                        })
+        else:
+            # 尝试查找其他可能的分类区域
+            all_a_tags = soup.find_all('a')
+            for a in all_a_tags:
+                if '总体排行' in a.text:
+                    ul_tag = a.find_parent('ul')
+                    if ul_tag:
+                        li_tags = ul_tag.find_all('li')
+                        for li in li_tags:
+                            a_tag = li.find('a')
+                            if a_tag:
+                                category_links.append({
+                                    '分类': a_tag.text.strip(),
+                                    '链接': a_tag['href'] if a_tag.has_attr('href') else ''
+                                })
+                        break
+        
+        return category_links
+    
+    def _extract_books(self, soup):
+        """提取书籍列表"""
+        books = []
+        
+        # 查找书籍表格
+        table_tag = soup.find('table', class_='table_line')
+        if table_tag:
+            tr_tags = table_tag.find_all('tr')[1:]  # 跳过表头
+            
+            for i, tr in enumerate(tr_tags):
+                td_tags = tr.find_all('td')
+                if len(td_tags) >= 6:
+                    # 提取序列
+                    sequence = td_tags[0].get_text(strip=True)
+                    # 提取题名
+                    title_a_tag = td_tags[1].find('a')
+                    title = title_a_tag.get_text(strip=True) if title_a_tag else td_tags[1].get_text(strip=True)
+                    # 提取责任者
+                    author = td_tags[2].get_text(strip=True)
+                    # 提取出版信息
+                    pub_info = td_tags[3].get_text(strip=True)
+                    # 提取索书号
+                    call_no = td_tags[4].get_text(strip=True)
+                    # 提取收藏人次
+                    shelf_count = td_tags[5].get_text(strip=True)
+                    
+                    book = {
+                        '序列': sequence,
+                        '题名': title,
+                        '责任者': author,
+                        '出版信息': pub_info,
+                        '索书号': call_no,
+                        '收藏人次': shelf_count
+                    }
+                    books.append(book)
+        
+        return books
+
+class HotBookExtractor(BaseExtractor):
+    """热门图书数据提取器类"""
+    
+    def extract_data(self):
+        """提取数据"""
+        # 从URL获取内容
+        soup = self._get_soup_from_url(self.source)
+        
+        # 提取分类列表
+        category_links = self._extract_category_links(soup)
+        
+        # 提取书籍列表
+        books = self._extract_books(soup)
+        
+        # 整合所有数据
+        self.data = {
+            '分类列表': category_links,
+            '书籍列表': books
+        }
+        
+        return self.data
+    
+    def _extract_category_links(self, soup):
+        """提取分类列表"""
+        category_links = []
+        
+        # 查找分类链接区域
+        underlinemenu_tag = soup.find('div', id='underlinemenu')
+        if underlinemenu_tag:
+            ul_tag = underlinemenu_tag.find('ul')
+            if ul_tag:
+                li_tags = ul_tag.find_all('li')
+                for li in li_tags:
+                    a_tag = li.find('a')
+                    if a_tag:
+                        category_links.append({
+                            '分类': a_tag.text.strip(),
+                            '链接': a_tag['href'] if a_tag.has_attr('href') else ''
+                        })
+        else:
+            # 尝试查找其他可能的分类区域
+            all_a_tags = soup.find_all('a')
+            for a in all_a_tags:
+                if '总体排行' in a.text:
+                    ul_tag = a.find_parent('ul')
+                    if ul_tag:
+                        li_tags = ul_tag.find_all('li')
+                        for li in li_tags:
+                            a_tag = li.find('a')
+                            if a_tag:
+                                category_links.append({
+                                    '分类': a_tag.text.strip(),
+                                    '链接': a_tag['href'] if a_tag.has_attr('href') else ''
+                                })
+                        break
+        
+        return category_links
+    
+    def _extract_books(self, soup):
+        """提取书籍列表"""
+        books = []
+        
+        # 查找书籍表格
+        table_tag = soup.find('table', class_='table_line')
+        if table_tag:
+            tr_tags = table_tag.find_all('tr')[1:]  # 跳过表头
+            
+            for i, tr in enumerate(tr_tags):
+                td_tags = tr.find_all('td')
+                if len(td_tags) >= 6:
+                    # 提取序列
+                    sequence = td_tags[0].get_text(strip=True)
+                    # 提取题名
+                    title_a_tag = td_tags[1].find('a')
+                    title = title_a_tag.get_text(strip=True) if title_a_tag else td_tags[1].get_text(strip=True)
+                    # 提取责任者
+                    author = td_tags[2].get_text(strip=True)
+                    # 提取出版信息
+                    pub_info = td_tags[3].get_text(strip=True)
+                    # 提取索书号
+                    call_no = td_tags[4].get_text(strip=True)
+                    # 提取浏览次数
+                    browse_count = td_tags[5].get_text(strip=True)
+                    
+                    book = {
+                        '序列': sequence,
+                        '题名': title,
+                        '责任者': author,
+                        '出版信息': pub_info,
+                        '索书号': call_no,
+                        '浏览次数': browse_count
+                    }
+                    books.append(book)
+        
+        return books
+
+class BookSearchExtractor(BaseExtractor):
+    """图书检索数据提取器类"""
+    
+    def extract_data(self):
+        """提取数据"""
+        # 从URL获取内容
+        soup = self._get_soup_from_url(self.source)
+        
+        # 提取书籍列表
+        books = self._extract_books(soup)
+        
+        # 整合数据
+        self.data = {
+            '书籍列表': books
+        }
+        
+        return self.data
+    
+    def _extract_books(self, soup):
+        """提取书籍列表"""
+        books = []
+        
+        # 查找目标ol元素
+        ol_tag = soup.find('ol', id='search_book_list')
+        if ol_tag:
+            li_tags = ol_tag.find_all('li', class_='book_list_info')
+            
+            for i, li in enumerate(li_tags):
+                # 提取图书分类
+                h3_tag = li.find('h3')
+                category = h3_tag.find('span').get_text(strip=True) if h3_tag else ''
+                
+                # 提取详情链接
+                a_tag = h3_tag.find('a') if h3_tag else None
+                link = a_tag['href'] if (a_tag and a_tag.has_attr('href')) else ''
+                
+                # 提取标题
+                title = a_tag.get_text(strip=True) if a_tag else ''
+                # 处理标题，去掉前面的序号和后面的索书号
+                if title:
+                    # 去掉前面的序号（如"1."）
+                    if '.' in title:
+                        title = title.split('.', 1)[1].strip()
+                    # 去掉后面的索书号（如" TP311.12/37=3  "）
+                    if title and len(title) > 5:
+                        # 查找最后一个空格后面的索书号
+                        last_space_idx = title.rfind(' ')
+                        if last_space_idx > 0:
+                            # 检查最后部分是否包含/或=等索书号特征
+                            if any(char in title[last_space_idx:] for char in ['/', '=', ' ']):
+                                title = title[:last_space_idx].strip()
+                
+                # 提取馆藏复本和可借复本
+                p_tag = li.find('p')
+                holdings = 0
+                available = 0
+                if p_tag:
+                    span_tag = p_tag.find('span')
+                    if span_tag:
+                        span_text = span_tag.get_text(strip=True)
+                        # 提取馆藏复本
+                        if '馆藏复本：' in span_text:
+                            holdings_part = span_text.split('馆藏复本：')[1].split('\n')[0].strip()
+                            holdings = int(holdings_part) if holdings_part.isdigit() else 0
+                        # 提取可借复本
+                        if '可借复本：' in span_text:
+                            available_part = span_text.split('可借复本：')[1].strip()
+                            available = int(available_part) if available_part.isdigit() else 0
+                
+                # 提取责任者和出版社
+                author = ''
+                publisher = ''
+                if p_tag:
+                    # 获取p标签的所有纯文本内容，自动处理HTML标签
+                    p_text = p_tag.get_text()
+                    # 按换行符分割
+                    lines = p_text.split('\n')
+                    # 过滤掉空行和只包含空格的行
+                    lines = [line.strip() for line in lines if line.strip()]
+                    
+                    # 提取责任人和出版社
+                    if len(lines) >= 3:
+                        author_line = lines[1]
+                        # 去掉责任者前面的"可借复本：X "内容
+                        if '可借复本：' in author_line:
+                            author = author_line.split('可借复本：')[-1].strip()
+                            # 如果还包含数字，进一步处理
+                            if author and any(char.isdigit() for char in author):
+                                # 找到第一个数字后的位置
+                                for i, char in enumerate(author):
+                                    if char.isdigit():
+                                        # 跳过数字和后面的空格
+                                        author = author.split(' ', 1)[1].strip() if ' ' in author else author
+                                        break
+                        else:
+                            author = author_line
+                        
+                        publisher = lines[2]
+                        # 去掉出版社后面可能的无关内容
+                        if publisher and '馆藏' in publisher:
+                            publisher = publisher.split('馆藏')[0].strip()
+                
+                # 构建书籍字典
+                book = {
+                    '图书分类': category,
+                    '详情链接': link,
+                    '标题': title,
+                    '馆藏复本': holdings,
+                    '可借复本': available,
+                    '责任者': author,
+                    '出版社': publisher
+                }
+                books.append(book)
+        
+        return books
+
+class BookDetailExtractor(BaseExtractor):
+    """图书检索详情数据提取器类"""
+    
+    def extract_data(self):
+        """提取数据"""
+        # 从URL获取内容
+        soup = self._get_soup_from_url(self.source)
+        
+        # 提取书目信息
+        book_info = self._extract_book_info(soup)
+        
+        # 提取馆藏信息
+        holdings = self._extract_holdings(soup)
+        
+        # 整合数据
+        self.data = {
+            '书目信息': book_info,
+            '馆藏信息': holdings
+        }
+        
+        return self.data
+    
+    def _extract_book_info(self, soup):
+        """提取书目信息"""
+        book_info = {}
+        
+        # 查找书目信息区域
+        book_info_div = soup.find('div', id='book_info')
+        if book_info_div:
+            # 查找所有dl.booklist元素
+            dl_tags = book_info_div.find_all('dl', class_='booklist')
+            for dl in dl_tags:
+                dt_tag = dl.find('dt')
+                dd_tag = dl.find('dd')
+                if dt_tag and dd_tag:
+                    # 提取字段名和字段值
+                    field_name = dt_tag.get_text(strip=True)
+                    # 去除字段名末尾的冒号
+                    field_name = field_name.rstrip(':')
+                    # 提取纯文本，去除HTML标签
+                    field_value = dd_tag.get_text(strip=True)
+                    # 保存到字典
+                    if field_name and field_value:
+                        # 处理重复字段（如个人责任者、中图法分类号）
+                        if field_name in book_info:
+                            # 如果已有该字段，合并值
+                            existing_value = book_info[field_name]
+                            if field_value not in existing_value:
+                                book_info[field_name] = f"{existing_value}; {field_value}"
+                        else:
+                            book_info[field_name] = field_value
+        
+        # 移除空值或无效字段
+        if '豆瓣简介：' in book_info and not book_info['豆瓣简介：'].strip():
+            del book_info['豆瓣简介：']
+        
+        return book_info
+    
+    def _extract_holdings(self, soup):
+        """提取馆藏信息"""
+        holdings = []
+        
+        # 查找馆藏信息表格
+        item_table = soup.find('table', id='item')
+        if item_table:
+            # 获取表头
+            header_tr = item_table.find('tr', class_='greytext1')
+            headers = []
+            if header_tr:
+                # 提取表头文本
+                header_tds = header_tr.find_all('td')
+                headers = [td.get_text(strip=True) for td in header_tds]
+            
+            # 获取数据行
+            data_trs = item_table.find_all('tr', class_='whitetext')
+            for tr in data_trs:
+                data_tds = tr.find_all('td')
+                if data_tds and len(data_tds) >= len(headers):
+                    holding_item = {}
+                    for i, header in enumerate(headers):
+                        # 提取单元格文本，处理馆藏地字段
+                        if i == 3:  # 馆藏地字段
+                            # 提取纯文本，去除HTML标签
+                            cell_text = data_tds[i].get_text(strip=True)
+                            # 清理文本，去除多余空格
+                            cell_text = ' '.join(cell_text.split())
+                        else:
+                            cell_text = data_tds[i].get_text(strip=True)
+                        holding_item[header] = cell_text
+                    holdings.append(holding_item)
+        
+        return holdings
+
+# 校园导航数据提取类
+class CampusNavigationExtractor(BaseExtractor):
+    """校园导航数据提取器类"""
+    
+    def extract_data(self):
+        """提取校园导航数据"""
+        # 使用lxml解析HTML
+        response = requests.get(self.source, headers={'User-Agent': fake_useragent.UserAgent().random})
+        response.encoding = 'utf-8'
+        html = etree.HTML(response.text)
+        
+        # 目标XPath路径
+        nav_container_xpath = "/html/body/div[3]/div[2]/div/div[2]/div/div"
+        nav_container = html.xpath(nav_container_xpath)
+        
+        if nav_container:
+            container = nav_container[0]
+            
+            # 提取所有内容
+            content = container.xpath(".//*[not(self::script) and not(self::style)]")
+            
+            # 初始化结果字典
+            navigation_info = {
+                "交通位置图": {
+                    "标题": "",
+                    "图片": ""
+                },
+                "乘车指南": {
+                    "从北京出发": [],
+                    "从天津出发": [],
+                    "从天津滨海国际机场出发": []
+                },
+                "校园平面图": {
+                    "标题": "",
+                    "图片": ""
+                }
+            }
+            
+            # 当前处理的部分
+            current_section = None
+            current_subsection = None
+            
+            # 直接查找所有图片，先保存下来
+            all_imgs = container.xpath(".//img")
+            img_list = []
+            for img in all_imgs:
+                src = img.get("src")
+                if src:
+                    # 处理图片URL
+                    if not src.startswith("http"):
+                        if src.startswith("//"):
+                            img_url = f"https:{src}"
+                        elif src.startswith("/"):
+                            img_url = f"https://tj.ustb.edu.cn{src}"
+                        else:
+                            img_url = f"https://tj.ustb.edu.cn/{src}"
+                    else:
+                        img_url = src
+                    img_list.append(img_url)
+            
+            # 处理文本内容
+            for element in content:
+                # 提取文本内容
+                text = element.xpath("string()").strip()
+                if not text:
+                    continue
+                
+                # 检查标题
+                if "交通位置图" in text:
+                    current_section = "交通位置图"
+                    navigation_info["交通位置图"]["标题"] = text
+                    # 分配第一个图片给交通位置图
+                    if img_list:
+                        navigation_info["交通位置图"]["图片"] = img_list[0]
+                    continue
+                elif "乘车指南" in text:
+                    current_section = "乘车指南"
+                    continue
+                elif "校园平面图" in text:
+                    current_section = "校园平面图"
+                    navigation_info["校园平面图"]["标题"] = text
+                    # 分配第二个图片给校园平面图
+                    if len(img_list) > 1:
+                        navigation_info["校园平面图"]["图片"] = img_list[1]
+                    continue
+                elif "从北京出发" in text:
+                    current_subsection = "从北京出发"
+                    continue
+                elif "从天津出发" in text:
+                    current_subsection = "从天津出发"
+                    continue
+                elif "从天津滨海国际机场出发" in text:
+                    current_subsection = "从天津滨海国际机场出发"
+                    continue
+                
+                # 添加乘车指南内容
+                if current_section == "乘车指南" and current_subsection:
+                    # 过滤掉不需要的内容
+                    if text not in ["—>", ""]:
+                        navigation_info["乘车指南"][current_subsection].append(text)
+            
+            self.data = navigation_info
+        else:
+            self.data = {"error": "未找到目标导航信息容器"}
+        
+        return self.data
+
+# 校友之家数据提取类
+class AlumniHomeExtractor(BaseExtractor):
+    """校友之家数据提取器类"""
+    
+    def extract_data(self):
+        """提取校友之家数据"""
+        # 使用lxml解析HTML
+        response = requests.get(self.source, headers={'User-Agent': fake_useragent.UserAgent().random})
+        response.encoding = 'utf-8'
+        html = etree.HTML(response.text)
+        
+        # 目标XPath路径 - 从校友之家.py文件中获取
+        xpath = "/html/body/section[2]/div/div/div[2]/div/div[2]/div[1]/ul"
+        ul_elements = html.xpath(xpath)
+        
+        if not ul_elements:
+            self.data = {"error": "未找到目标元素"}
+            return self.data
+        
+        results = []
+        
+        # 处理找到的ul元素
+        for ul in ul_elements:
+            # 提取所有li子元素
+            li_elements = ul.xpath('./li')
+            
+            # 遍历每个li元素
+            for li in li_elements:
+                # 尝试使用更通用的XPath查找a标签
+                a_tags = li.xpath('.//a')
+                
+                for a_tag in a_tags:
+                    # 提取标题和日期
+                    title_text = ''.join(a_tag.xpath('.//text()')).strip()
+                    title_parts = title_text.split('\r\n')
+                    
+                    if len(title_parts) >= 2:
+                        title = title_parts[0].strip()
+                        date = title_parts[1].strip()
+                    else:
+                        title = title_text.strip()
+                        date = ""
+                    
+                    # 提取链接
+                    href = a_tag.get('href', '')
+                    
+                    # 处理相对链接
+                    if href and not href.startswith('http'):
+                        if href.startswith('//'):
+                            full_href = f"https:{href}"
+                        elif href.startswith('/'):
+                            full_href = f"https://tj.ustb.edu.cn{href}"
+                        else:
+                            # 对于相对路径，根据当前URL构建完整路径
+                            if self.source.endswith('/'):
+                                base_url = self.source
+                            else:
+                                base_url = '/'.join(self.source.split('/')[:-1]) + '/'
+                            full_href = base_url + href.lstrip('./')
+                    else:
+                        full_href = href
+                    
+                    # 检查是否有有效的标题和链接
+                    if title and full_href:
+                        results.append({
+                            '标题': title,
+                            '日期': date,
+                            '链接': full_href.replace("index/", "")
+                        })
+        
+        # 去重
+        seen = set()
+        unique_results = []
+        for item in results:
+            if item['链接'] not in seen:
+                seen.add(item['链接'])
+                unique_results.append(item)
+        
+        self.data = {
+            'items': unique_results
+        }
+        
+        return self.data
+
+# 科研项目数据提取类
+class ResearchProjectExtractor(BaseExtractor):
+    """科研项目数据提取器类"""
+    import re
+    def __init__(self, source):
+        """初始化提取器
+        
+        Args:
+            source: 数据源URL，默认使用科研项目首页
+        """
+        # 如果没有提供source，使用默认URL
+        if not source:
+            source = "https://tj.ustb.edu.cn/index/xsky.htm"
+        super().__init__(source)
+    
+    def extract_data(self):
+        """提取科研项目数据"""
+        try:
+            # 获取总页数
+            total_pages = self._get_total_pages()
+            
+            all_projects = []
+            
+            # 首先访问首页
+            index_projects = self._extract_research_projects(self.source)
+            all_projects.extend(index_projects)
+            
+            # 然后从总页数-1开始倒叙访问
+            start_page = total_pages - 1
+            if start_page > 0:
+                base_url = "https://tj.ustb.edu.cn"
+                for page in range(start_page, 0, -1):
+                    page_url = f"{base_url}/index/xsky/{page}.htm"
+                    page_projects = self._extract_research_projects(page_url)
+                    all_projects.extend(page_projects)
+            
+            # 去重
+            seen = set()
+            unique_projects = []
+            for project in all_projects:
+                if project['链接'] not in seen:
+                    seen.add(project['链接'])
+                    unique_projects.append(project)
+            
+            self.data = {
+                'total': len(unique_projects),
+                'items': unique_projects
+            }
+            
+        except Exception as e:
+            self.data = {
+                'error': f'提取数据时出错: {str(e)}'
+            }
+        
+        return self.data
+    
+    def _get_total_pages(self):
+        """获取总页数
+        
+        Returns:
+            int: 总页数
+        """
+        try:
+            # 发送请求获取页面内容
+            response = requests.get(self.source, headers={'User-Agent': fake_useragent.UserAgent().random})
+            response.encoding = 'utf-8'
+            
+            # 解析HTML
+            html = etree.HTML(response.text)
+            
+            # 目标XPath
+            nums_xpath = "/html/body/div[4]/div/div/div/span[2]/span[9]/a"
+            
+            # 尝试使用主XPath
+            page_elements = html.xpath(nums_xpath)
+            
+            # 备选XPath
+            alternative_xpaths = [
+                "//div[@class='pagination']//a[last()]",
+                "//span[contains(@class, 'page')]//a[last()]",
+                "//*[contains(text(), '页')]//a[last()]"
+            ]
+            
+            # 如果主XPath失败，尝试备选XPath
+            if not page_elements:
+                for alt_xpath in alternative_xpaths:
+                    page_elements = html.xpath(alt_xpath)
+                    if page_elements:
+                        break
+            
+            if page_elements:
+                # 提取总页数
+                page_element = page_elements[0]
+                page_text = page_element.text.strip() if page_element.text else ""
+                # 提取数字
+                total_pages = int(''.join(filter(str.isdigit, page_text)))
+                return total_pages
+            else:
+                return 1
+                
+        except Exception as e:
+            return 1
+    
+    def _extract_research_projects(self, url):
+        """从指定URL提取科研项目信息
+        
+        Args:
+            url: 页面URL
+            
+        Returns:
+            list: 科研项目信息列表
+        """
+        try:
+            # 发送请求获取页面内容
+            response = requests.get(url, headers={'User-Agent': fake_useragent.UserAgent().random})
+            response.encoding = 'utf-8'
+            
+            # 解析HTML
+            html = etree.HTML(response.text)
+            
+            # 目标XPath
+            data_xpath = "/html/body/div[4]/div/ul"
+            
+            # 提取目标ul元素
+            ul_elements = html.xpath(data_xpath)
+            
+            if not ul_elements:
+                return []
+            
+            results = []
+            
+            # 处理找到的ul元素
+            for ul in ul_elements:
+                # 提取所有li子元素
+                li_elements = ul.xpath('./li')
+                
+                # 遍历每个li元素
+                for li in li_elements:
+                    # 提取a标签
+                    a_tag = li.find('.//a')
+                    if a_tag is not None:
+                        # 提取标题
+                        title = a_tag.text.strip() if a_tag.text else ''
+                        # 尝试获取所有文本内容
+                        if not title:
+                            title = ''.join(a_tag.xpath('.//text()')).strip()
+                        
+                        # 提取链接
+                        href = a_tag.get('href', '')
+                        # 处理相对链接
+                        if href and not href.startswith('http'):
+                            if href.startswith('//'):
+                                full_href = f"https:{href}"
+                            elif href.startswith('/'):
+                                full_href = f"https://tj.ustb.edu.cn{href}"
+                            else:
+                                full_href = f"https://tj.ustb.edu.cn/{href}"
+                        else:
+                            full_href = href
+                        
+                        # 提取日期
+                        date = ""
+                        # 尝试从li元素中提取日期
+                        date_elements = li.xpath('.//*[contains(text(), "-") and contains(text(), "-")]')
+                        if date_elements:
+                            date = date_elements[0].text.strip() if date_elements[0].text else ""
+                        # 尝试从li元素的文本中提取日期
+                        if not date:
+                            li_text = ''.join(li.xpath('.//text()')).strip()
+                            # 查找日期格式的文本
+                            import re
+                            date_match = re.search(r'\d{4}-\d{2}-\d{2}', li_text)
+                            if date_match:
+                                date = date_match.group()
+                        
+                        # 检查是否有有效的标题和链接
+                        if title and full_href:
+                            results.append({
+                                '标题': re.findall(r'\r\n(.*?)\r\n', title)[0],
+                                '链接': full_href,
+                                '日期': date
+                            })
+            
+            return results
+            
+        except Exception as e:
+            return []
+
+def ocr_captcha(captcha_png):
+    """使用ddddocr识别验证码图片（返回识别结果）"""
+    import ddddocr
+    # 初始化OCR
+    ocr = ddddocr.DdddOcr()
+    # 调用classification方法（内部会调用predict）
+    text = ocr.classification(captcha_png)
+    return text
+
+# -------------------------- API接口定义（原逻辑保留） --------------------------
+@app.route('/api/captcha', methods=['GET'])
+def api_captcha():
+    """
+    获取验证码图片接口
+    返回：验证码图片二进制流 + 响应头X-Session-Id
+    """
+    try:
+        # 每个验证码请求创建独立会话
+        session = requests.Session()
+        # 生成简易session_id（生产建议用uuid）
+        session_id = str(random.randint(100000, 999999))
+        captcha_content = get_captcha_png(session)
+        # 临时存储session（生产建议用Redis）
+        app.config.setdefault('SESSION_POOL', {})[session_id] = session
+        # 返回图片+session_id
+        response = send_file(BytesIO(captcha_content), mimetype='image/png')
+        response.headers['X-Session-Id'] = session_id
+        return response
+    except Exception as e:
+        return jsonify({"code": 500, "msg": f"获取验证码失败：{str(e)}"}), 500
+
+
+@app.route('/api/login', methods=['POST'])
+def api_login():
+    """
+    登录接口（包含测试账号）
+    请求参数（JSON）：
+    {
+        "session_id": "验证码接口返回的session_id",
+        "username": "用户名",
+        "password": "密码",
+        "captcha": "验证码"
+    }
+    """
+    try:
+        req_data = request.get_json()
+
+        # 1. 校验参数
+        required_params = ["session_id", "username", "password", "captcha"]
+        if not all(k in req_data for k in required_params):
+            return jsonify({"code": 400, "msg": "参数缺失"}), 400
+
+        session_id = req_data["session_id"]
+        username = req_data["username"]
+        password = req_data["password"]
+        captcha = req_data["captcha"]
+
+        # ============ 新增：测试账号逻辑 ============
+        # 定义测试账号（可以修改或添加更多）
+        test_accounts = {
+            "test": "123456",
+            "admin": "admin123",
+            "demo": "demo123"
+        }
+
+        # 如果是测试账号，直接返回成功，不走真实爬虫
+        if username in test_accounts and password == test_accounts[username]:
+            print(f"✅ 测试账号登录: {username}")
+
+            # 测试账号的固定返回数据（根据你的需要修改）
+            test_student_info = [
+                ["学生姓名", "姜玖儿"],
+                ["学生编号", "245150000"],
+                ["所属院系", "计算机系"],
+                ["专业名称", "计算机科学与技术"],
+                ["班级名称", "计2400"]
+            ]
+
+            # 生成测试token（固定值，方便调试）
+            token = f"test_token_{username}_{int(time.time())}"
+            app.config.setdefault('TOKEN_POOL', {})[token] = None  # 测试session为空
+
+            return jsonify({
+                "code": 200,
+                "msg": f"测试账号登录成功（{username}）",
+                "data": {
+                    "token": token,
+                    "student_info": test_student_info
+                }
+            })
+        # ============ 测试账号逻辑结束 ============
+
+        # 2. 获取临时存储的session（真实账号走这里）
+        session_pool = app.config.get('SESSION_POOL', {})
+        if session_id not in session_pool:
+            return jsonify({"code": 401, "msg": "session_id无效，请重新获取验证码"}), 401
+        session = session_pool[session_id]
+
+        # 3. 执行真实登录（调用爬虫）
+        login_success, msg = submit_login(session, username, password, captcha)
+        if not login_success:
+            # 登录失败，清理无效session
+            del session_pool[session_id]
+            return jsonify({"code": 403, "msg": msg}), 403
+
+        # 4. 登录成功，获取学生信息
+        student_info = get_student_info(session)
+
+        # 5. 生成token
+        token = str(random.randint(10000000, 99999999))
+        app.config.setdefault('TOKEN_POOL', {})[token] = session
+
+        return jsonify({
+            "code": 200,
+            "msg": "登录成功",
+            "data": {
+                "token": token,
+                "student_info": student_info
+            }
+        })
+    except Exception as e:
+        return jsonify({"code": 500, "msg": f"登录异常：{str(e)}"}), 500
+
+
+@app.route('/api/exam', methods=['POST'])
+def api_exam():
+    """
+    成绩查询接口
+    请求参数（JSON）：
+    {
+        "token": "登录接口返回的token",
+        "semester_stage": "学期阶段（可选）",
+        "course_nature": "课程性质（可选）",
+        "class_name": "课程名称（可选）",
+        "display_method": "显示方式（默认all）"
+    }
+    """
+    try:
+        req_data = request.get_json()
+        token = req_data.get("token")
+        if not token:
+            return jsonify({"code": 400, "msg": "token缺失"}), 400
+
+        # 校验token
+        token_pool = app.config.get('TOKEN_POOL', {})
+        if token not in token_pool:
+            return jsonify({"code": 401, "msg": "token无效/已过期"}), 401
+        session = token_pool[token]
+
+        # 执行成绩查询
+        exam_data = get_exam(
+            session=session,
+            semester_stage=req_data.get("semester_stage", ""),
+            course_nature=req_data.get("course_nature", ""),
+            class_name=req_data.get("class_name", ""),
+            display_method=req_data.get("display_method", "all")
+        )
+
+        return jsonify({
+            "code": 200,
+            "msg": "查询成功",
+            "data": exam_data
+        })
+    except Exception as e:
+        return jsonify({"code": 500, "msg": f"成绩查询异常：{str(e)}"}), 500
+
+
+@app.route('/api/lesson', methods=['POST'])
+def api_lesson():
+    """
+    课表查询接口
+    请求参数（JSON）：
+    {
+        "token": "登录接口返回的token",
+        "now_time": "查询日期（格式：2024-05-20）"
+    }
+    """
+    try:
+        req_data = request.get_json()
+        token = req_data.get("token")
+        now_time = req_data.get("now_time")
+        if not token or not now_time:
+            return jsonify({"code": 400, "msg": "token/日期缺失"}), 400
+
+        # 校验token
+        token_pool = app.config.get('TOKEN_POOL', {})
+        if token not in token_pool:
+            return jsonify({"code": 401, "msg": "token无效/已过期"}), 401
+        session = token_pool[token]
+
+        # 执行课表查询
+        lesson_data = get_lesson(session, now_time)
+
+        return jsonify({
+            "code": 200,
+            "msg": "查询成功",
+            "data": lesson_data
+        })
+    except Exception as e:
+        return jsonify({"code": 500, "msg": f"课表查询异常：{str(e)}"}), 500
+    
+@app.route('/api/student_info', methods=['POST'])
+def api_student_info():
+    """
+    获取学生个人信息接口
+    请求参数（JSON）：{"token": "..."}
+    """
+    try:
+        req_data = request.get_json()
+        token = req_data.get("token")
+        if not token:
+            return jsonify({"code": 400, "msg": "token缺失"}), 400
+
+        # 校验token
+        token_pool = app.config.get('TOKEN_POOL', {})
+        if token not in token_pool:
+            return jsonify({"code": 401, "msg": "token无效/已过期"}), 401
+        
+        # 获取session
+        session = token_pool[token]
+
+        # 如果是测试token（session为None），返回固定的测试数据
+        if session is None:
+             return jsonify({
+                "code": 200,
+                "msg": "查询成功(测试)",
+                "data": [
+                    ["学生姓名", "姜玖儿"], 
+                    ["学生编号", "245150000"], 
+                    ["所属院系", "计算机系"], 
+                    ["专业名称", "计算机科学与技术"], 
+                    ["班级名称", "计2400"]
+                ]
+            })
+
+        # 执行真实爬虫
+        info_data = get_student_info(session)
+
+        # 校验爬虫结果
+        if not info_data:
+             return jsonify({"code": 404, "msg": "未查询到学生信息，请重试"}), 404
+
+        return jsonify({
+            "code": 200,
+            "msg": "查询成功",
+            "data": info_data
+        })
+    except Exception as e:
+        return jsonify({"code": 500, "msg": f"信息查询异常：{str(e)}"}), 500
+
+@app.route('/api/logout', methods=['POST'])
+def api_logout():
+    """
+    退出登录接口
+    请求参数（JSON）：{"token": "登录返回的token"}
+    """
+    try:
+        req_data = request.get_json()
+        token = req_data.get("token")
+        if not token:
+            return jsonify({"code": 400, "msg": "token缺失"}), 400
+
+        # 清理token
+        token_pool = app.config.get('TOKEN_POOL', {})
+        if token in token_pool:
+            del token_pool[token]
+
+        return jsonify({"code": 200, "msg": "退出成功"})
+    except Exception as e:
+        return jsonify({"code": 500, "msg": f"退出异常：{str(e)}"}), 500
+
+
+
+@app.route('/api/notice', methods=['GET'])
+def get_notice():
+    """
+    获取通知公告API接口
+    :return: JSON格式的通知公告数据
+    """
+    try:
+        result = get_final_result()
+        return jsonify({
+            'code': 200,
+            'message': 'success',
+            'data': result
+        })
+    except Exception as e:
+        return jsonify({
+            'code': 500,
+            'message': f'error: {str(e)}',
+            'data': {}
+        })
+
+# API接口路由
+@app.route('/api/college_class', methods=['GET'])
+def api_college_class():
+    try:
+        result = get_college_class()
+        return jsonify({
+            'status': 'success',
+            'data': result
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+# API接口路由 - 获取系部动态详情
+@app.route('/api/college_class_news', methods=['GET'])
+def api_college_class_news():
+    from flask import request
+    try:
+        # 获取URL参数
+        class_url = request.args.get('class_url')
+        if not class_url:
+            return jsonify({
+                'status': 'error',
+                'message': 'Missing class_url parameter'
+            }), 400
+        
+        result = get_college_class_news(class_url)
+        return jsonify({
+            'status': 'success',
+            'data': result
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+# API接口 - 获取学生照片
+@app.route('/api/student/img', methods=['POST'])
+def api_get_student_img():
+    """
+    获取学生照片的API接口
+    返回小程序支持的Base64格式图片
+    请求参数（JSON）：{"token": "登录返回的token"}
+    """
+    try:
+        req_data = request.get_json()
+        token = req_data.get("token")
+        if not token:
+            return jsonify({
+                'success': False,
+                'error': 'token缺失'
+            }), 400
+
+        # 校验token
+        token_pool = app.config.get('TOKEN_POOL', {})
+        if token not in token_pool:
+            return jsonify({
+                'success': False,
+                'error': 'token无效/已过期'
+            }), 401
+        session = token_pool[token]
+
+        # 如果是测试token（session为None），返回默认测试图片
+        if session is None:
+            # 生成一个默认的测试图片（Base64格式）
+            test_img_base64 = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=='
+            return jsonify({
+                'success': True,
+                'data': test_img_base64
+            })
+        # 执行真实爬虫获取图片
+        img_base64 = get_student_img(session)
+        return jsonify({
+            'success': True,
+            'data': img_base64
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+# API接口 - 获取学生所有信息
+@app.route('/api/student/info', methods=['POST'])
+def api_get_all_student_info():
+    """
+    获取学生所有信息的API接口
+    返回键值对格式
+    请求参数（JSON）：{"token": "登录返回的token"}
+    """
+    try:
+        req_data = request.get_json()
+        token = req_data.get("token")
+        if not token:
+            return jsonify({
+                'success': False,
+                'error': 'token缺失'
+            }), 400
+
+        # 校验token
+        token_pool = app.config.get('TOKEN_POOL', {})
+        if token not in token_pool:
+            return jsonify({
+                'success': False,
+                'error': 'token无效/已过期'
+            }), 401
+        session = token_pool[token]
+        # 如果是测试token（session为None），返回固定的测试数据
+        if session is None:
+            test_info = {
+                "姓名": "姜玖儿",
+                "性别": "男",
+                "出生日期": "20000520",
+                "民族": "汉族",
+                "政治面貌": "群众",
+                "婚否": "未婚",
+                "身份证编号": "620***************",
+                "籍贯": "甘肃省",
+                "院系": "计算机系",
+                "专业": "计算机科学与技术",
+                "学制": 4,
+                "入学日期": "202409",
+                "班级": "计2400",
+                "学号": "245150000",
+                "入学学号": "24620500000000",
+                "本人电话": "13140000000",
+                "家庭现住址": "甘肃省**********",
+                "邮政编码": "7****1",
+                "联系人": "他爸",
+                "家庭电话": "177*******7",
+                "入党团时间": "-"
+            }
+            return jsonify({
+                'success': True,
+                'data': test_info
+            })
+
+        # 执行真实爬虫获取信息
+        print("开始调用get_all_student_info()")
+        info = get_all_student_info(session)
+        return jsonify({
+            'success': True,
+            'data': info
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+# API接口
+@app.route('/api/hot_borrowed', methods=['GET'])
+def api_hot_borrowed():
+    """热门借阅数据API接口
+    
+    GET参数:
+        url: 必需，数据源URL
+    
+    返回:
+        JSON格式的热门借阅数据
+    """
+    try:
+        # 获取请求参数
+        url = request.args.get('url', '')
+        if not url:
+            return jsonify({
+                'code': 400,
+                'message': '缺少url参数',
+                'data': None
+            })
+        
+        # 调用提取器获取数据
+        extractor = HotBorrowedExtractor(url)
+        data = extractor.extract_data()
+        
+        # 返回JSON响应
+        return jsonify({
+            'code': 200,
+            'message': 'success',
+            'data': data
+        })
+        
+    except Exception as e:
+        # 处理异常
+        return jsonify({
+            'code': 500,
+            'message': f'获取数据失败: {str(e)}',
+            'data': None
+        })
+
+@app.route('/api/hot_scored', methods=['GET'])
+def api_hot_scored():
+    """热门评分数据API接口
+    
+    GET参数:
+        url: 必需，数据源URL
+    
+    返回:
+        JSON格式的热门评分数据
+    """
+    try:
+        # 获取请求参数
+        url = request.args.get('url', '')
+        if not url:
+            return jsonify({
+                'code': 400,
+                'message': '缺少url参数',
+                'data': None
+            })
+        
+        # 调用提取器获取数据
+        extractor = HotScoreExtractor(url)
+        data = extractor.extract_data()
+        
+        # 返回JSON响应
+        return jsonify({
+            'code': 200,
+            'message': 'success',
+            'data': data
+        })
+        
+    except Exception as e:
+        # 处理异常
+        return jsonify({
+            'code': 500,
+            'message': f'获取数据失败: {str(e)}',
+            'data': None
+        })
+
+@app.route('/api/hot_shelved', methods=['GET'])
+def api_hot_shelved():
+    """热门收藏数据API接口
+    
+    GET参数:
+        url: 必需，数据源URL
+    
+    返回:
+        JSON格式的热门收藏数据
+    """
+    try:
+        # 获取请求参数
+        url = request.args.get('url', '')
+        if not url:
+            return jsonify({
+                'code': 400,
+                'message': '缺少url参数',
+                'data': None
+            })
+        
+        # 调用提取器获取数据
+        extractor = HotShelfExtractor(url)
+        data = extractor.extract_data()
+        
+        # 返回JSON响应
+        return jsonify({
+            'code': 200,
+            'message': 'success',
+            'data': data
+        })
+        
+    except Exception as e:
+        # 处理异常
+        return jsonify({
+            'code': 500,
+            'message': f'获取数据失败: {str(e)}',
+            'data': None
+        })
+
+@app.route('/api/hot_books', methods=['GET'])
+def api_hot_books():
+    """热门图书数据API接口
+    
+    GET参数:
+        url: 必需，数据源URL
+    
+    返回:
+        JSON格式的热门图书数据
+    """
+    try:
+        # 获取请求参数
+        url = request.args.get('url', '')
+        if not url:
+            return jsonify({
+                'code': 400,
+                'message': '缺少url参数',
+                'data': None
+            })
+        
+        # 调用提取器获取数据
+        extractor = HotBookExtractor(url)
+        data = extractor.extract_data()
+        
+        # 返回JSON响应
+        return jsonify({
+            'code': 200,
+            'message': 'success',
+            'data': data
+        })
+        
+    except Exception as e:
+        # 处理异常
+        return jsonify({
+            'code': 500,
+            'message': f'获取数据失败: {str(e)}',
+            'data': None
+        })
+
+@app.route('/api/book_search', methods=['GET'])
+def api_book_search():
+    """图书检索数据API接口
+    
+    GET参数:
+        url: 必需，数据源URL
+    
+    返回:
+        JSON格式的图书检索数据
+    """
+    try:
+        # 获取请求参数
+        url = request.args.get('url', '')
+        if not url:
+            return jsonify({
+                'code': 400,
+                'message': '缺少url参数',
+                'data': None
+            })
+        
+        # 调用提取器获取数据
+        extractor = BookSearchExtractor(url)
+        data = extractor.extract_data()
+        
+        # 返回JSON响应
+        return jsonify({
+            'code': 200,
+            'message': 'success',
+            'data': data
+        })
+        
+    except Exception as e:
+        # 处理异常
+        return jsonify({
+            'code': 500,
+            'message': f'获取数据失败: {str(e)}',
+            'data': None
+        })
+
+@app.route('/api/book_detail', methods=['GET'])
+def api_book_detail():
+    """图书检索详情数据API接口
+    
+    GET参数:
+        url: 必需，数据源URL
+    
+    返回:
+        JSON格式的图书检索详情数据
+    """
+    try:
+        # 获取请求参数
+        url = request.args.get('url', '')
+        if not url:
+            return jsonify({
+                'code': 400,
+                'message': '缺少url参数',
+                'data': None
+            })
+        
+        # 调用提取器获取数据
+        extractor = BookDetailExtractor(url)
+        data = extractor.extract_data()
+        
+        # 返回JSON响应
+        return jsonify({
+            'code': 200,
+            'message': 'success',
+            'data': data
+        })
+        
+    except Exception as e:
+        # 处理异常
+        return jsonify({
+            'code': 500,
+            'message': f'获取数据失败: {str(e)}',
+            'data': None
+        })
+
+@app.route('/api/campus_navigation', methods=['GET'])
+def api_campus_navigation():
+    """校园导航数据API接口
+    
+    GET参数:
+        url: 必需，数据源URL
+    
+    返回:
+        JSON格式的校园导航数据
+    """
+    try:
+        # 获取请求参数
+        url = request.args.get('url', '')
+        if not url:
+            return jsonify({
+                'code': 400,
+                'message': '缺少url参数',
+                'data': None
+            })
+        
+        # 调用提取器获取数据
+        extractor = CampusNavigationExtractor(url)
+        data = extractor.extract_data()
+        
+        # 返回JSON响应
+        return jsonify({
+            'code': 200,
+            'message': 'success',
+            'data': data
+        })
+        
+    except Exception as e:
+        # 处理异常
+        return jsonify({
+            'code': 500,
+            'message': f'获取数据失败: {str(e)}',
+            'data': None
+        })
+
+
+@app.route('/api/alumni/person_interview', methods=['GET'])
+def api_alumni_person_interview():
+    """校友之家人物访谈API接口
+    
+    GET参数:
+        url: 可选，数据源URL，默认使用 https://tj.ustb.edu.cn/xyh/index/rwft.htm
+    
+    返回:
+        JSON格式的人物访谈数据，包含标题、日期和链接
+    """
+    try:
+        # 获取请求参数
+        url = request.args.get('url', 'https://tj.ustb.edu.cn/xyh/index/rwft.htm')
+        
+        # 调用提取器获取数据
+        extractor = AlumniHomeExtractor(url)
+        data = extractor.extract_data()
+        
+        # 返回JSON响应
+        return jsonify({
+            'code': 200,
+            'message': 'success',
+            'data': data
+        })
+        
+    except Exception as e:
+        # 处理异常
+        return jsonify({
+            'code': 500,
+            'message': f'获取数据失败: {str(e)}',
+            'data': None
+        })
+
+@app.route('/api/alumni/notice', methods=['GET'])
+def api_alumni_notice():
+    """校友之家通知公告API接口
+    
+    GET参数:
+        url: 可选，数据源URL，默认使用 https://tj.ustb.edu.cn/xyh/index/tzgg.htm
+    
+    返回:
+        JSON格式的通知公告数据，包含标题、日期和链接
+    """
+    try:
+        # 获取请求参数
+        url = request.args.get('url', 'https://tj.ustb.edu.cn/xyh/index/tzgg.htm')
+        
+        # 调用提取器获取数据
+        extractor = AlumniHomeExtractor(url)
+        data = extractor.extract_data()
+        
+        # 返回JSON响应
+        return jsonify({
+            'code': 200,
+            'message': 'success',
+            'data': data
+        })
+        
+    except Exception as e:
+        # 处理异常
+        return jsonify({
+            'code': 500,
+            'message': f'获取数据失败: {str(e)}',
+            'data': None
+        })
+
+@app.route('/api/research/projects', methods=['GET'])
+def api_research_projects():
+    """科研项目数据API接口
+    
+    GET参数:
+        url: 可选，数据源URL，默认使用 https://tj.ustb.edu.cn/index/xsky.htm
+    
+    返回:
+        JSON格式的科研项目数据，包含所有标题、链接和日期
+    """
+    try:
+        # 获取请求参数
+        url = request.args.get('url', '')
+        
+        # 调用提取器获取数据
+        extractor = ResearchProjectExtractor(url)
+        data = extractor.extract_data()
+        
+        # 返回JSON响应
+        return jsonify({
+            'code': 200,
+            'message': 'success',
+            'data': data
+        })
+        
+    except Exception as e:
+        # 处理异常
+        return jsonify({
+            'code': 500,
+            'message': f'获取数据失败: {str(e)}',
+            'data': None
+        })
+
+@app.route('/api/ocr/captcha', methods=['POST'])
+def api_ocr_captcha():
+    """验证码识别API接口
+    
+    POST参数:
+        image: 必需，base64编码的验证码图片数据
+    
+    返回:
+        JSON格式的验证码识别结果
+    """
+    try:
+        # 获取请求参数
+        data = request.get_json()
+        if not data or 'image' not in data:
+            return jsonify({
+                'code': 400,
+                'message': '缺少image参数',
+                'data': None
+            })
+        
+        # 解码base64图片数据
+        image_data = data['image']
+        # 移除base64前缀（如果有）
+        if image_data.startswith('data:image'):
+            image_data = image_data.split(',')[1]
+        
+        # 解码base64数据
+        captcha_png = base64.b64decode(image_data)
+        
+        # 调用ocr_captcha函数识别验证码
+        text = ocr_captcha(captcha_png)
+        
+        # 返回JSON响应
+        return jsonify({
+            'code': 200,
+            'message': 'success',
+            'data': {
+                'text': text
+            }
+        })
+        
+    except Exception as e:
+        # 处理异常
+        return jsonify({
+            'code': 500,
+            'message': f'识别验证码失败: {str(e)}',
+            'data': None
+        })
+
+
+# -------------------------- 启动服务 --------------------------
+if __name__ == '__main__':
+    # 生产环境建议：
+    # 1. 使用Gunicorn+Nginx部署，开启HTTPS
+    # 2. 替换简易session/token为Redis存储
+    # 3. 添加接口限流、日志记录
+    app.run(
+        host='0.0.0.0',  # 允许外网访问
+        port=5000,  # 服务端口
+        debug=False  # 生产环境关闭debug
+    )
