@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 环境变量文件
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+test_main.http
+
+# 虚拟环境
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+
+# 日志
+logs/
+*.log
+
+# 排除项文件夹
+file/
